@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+import subprocess
+import os
+import sys
+from pathlib import Path
+
+# ===========================
+# CONFIGURACIÓN Y PARÁMETROS
+# ===========================
+
+if len(sys.argv) < 3:
+    print("Uso: python pipeline.py <archivo_samples> <lineage>")
+    sys.exit(1)
+
+SAMPLES = sys.argv[1]
+LINEAGE = sys.argv[2]
+
+HOME = str(Path.home())
+baseFOLDER = f"{HOME}/Proyectos/{LINEAGE}"
+originalfastaFOLDER = f"{HOME}/Documentos/Referencias_originales"
+indexed_ref_FOLDER = f"{HOME}/indexed_libs"
+bowtie2_samtools_FOLDER = f"{HOME}/miniconda3/envs/PipelineIdisba2/bin"
+javaFOLDER = f"{HOME}/miniconda3/envs/java17/bin"
+picardFOLDER = f"{HOME}/miniconda3/envs/PipelineIdisba2/share/picard-3.4.0-0"
+GATKfolder = f"{HOME}/miniconda3/envs/PipelineIdisba2/share/gatk4-4.6.2.0-0"
+snpEffFOLDER = f"{HOME}/miniconda3/envs/snpeff_only/share/snpeff-5.2-1"
+snpsiftFOLDER = f"{HOME}/miniconda3/envs/PipelineIdisba2/share/snpsift-5.2-0"
+
+# ===========================
+# FUNCIONES AUXILIARES
+# ===========================
+
+def run_cmd(cmd, cwd=None):
+    """Ejecuta un comando y detiene el script si falla."""
+    print(f"\n🧩 Ejecutando: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True, cwd=cwd)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error ejecutando el comando: {' '.join(cmd)}")
+        sys.exit(1)
+
+def ensure_dirs():
+    """Crea las carpetas necesarias."""
+    dirs = [
+        "sam_files",
+        "rawpileup_files",
+        "totalpileup_files",
+        "annotated_files",
+        "curated_files",
+        "intermediate_files"
+    ]
+    for d in dirs:
+        Path(f"{baseFOLDER}/{d}").mkdir(parents=True, exist_ok=True)
+
+# ===========================
+# PIPELINE PRINCIPAL
+# ===========================
+
+def process_sample(sample_id):
+    sample_id = sample_id.strip().replace("\r", "")
+    print(f"\n🚀 Procesando muestra {sample_id}\n")
+
+    fastq_r1 = f"{baseFOLDER}/Muestras/{sample_id}_L001_R1_001.fastq"
+    fastq_r2 = f"{baseFOLDER}/Muestras/{sample_id}_L001_R2_001.fastq"
+
+    # --- Descomprimir FASTQs ---
+    run_cmd(["gunzip", f"{fastq_r1}.gz"])
+    run_cmd(["gunzip", f"{fastq_r2}.gz"])
+
+    # --- BOWTIE2 ---
+    run_cmd([
+        f"{bowtie2_samtools_FOLDER}/bowtie2",
+        "--phred33",
+        "-x", f"{indexed_ref_FOLDER}/ATCC19424/ATCC19424",
+        "-q",
+        "-1", fastq_r1,
+        "-2", fastq_r2,
+        "-X", "500",
+        "-S", f"{baseFOLDER}/sam_files/{sample_id}.sam"
+    ])
+
+    # --- SAMTOOLS ---
+    bam_unsorted = f"{baseFOLDER}/intermediate_files/{sample_id}.bam"
+    bam_sorted = f"{baseFOLDER}/intermediate_files/{sample_id}_mapped.sorted.bam"
+    run_cmd([f"{bowtie2_samtools_FOLDER}/samtools", "view", "-bS", 
+             f"{baseFOLDER}/sam_files/{sample_id}.sam", "-o", bam_unsorted])
+    run_cmd([f"{bowtie2_samtools_FOLDER}/samtools", "sort", bam_unsorted, "-o", bam_sorted])
+
+    # --- PICARDTOOLS: AddOrReplaceReadGroups ---
+    with open(fastq_r1) as fq:
+        fastq_header = fq.readline().strip()
+
+    fields = fastq_header.split(":")
+    FLOWCELL, SEQLANE, INDEX = fields[2], fields[3], fields[9]
+
+    bam_rdg = f"{baseFOLDER}/intermediate_files/{sample_id}_mapped.sorted_RDG.bam"
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{picardFOLDER}/picard.jar", "AddOrReplaceReadGroups",
+        "-I", bam_sorted,
+        "-O", bam_rdg,
+        "-RGID", f"{FLOWCELL}.{SEQLANE}",
+        "-RGLB", "lib1",
+        "-RGPL", "ILLUMINA",
+        "-RGPU", f"{FLOWCELL}.{SEQLANE}.{INDEX}",
+        "-RGSM", sample_id
+    ])
+
+    # --- PICARDTOOLS: MarkDuplicates ---
+    bam_dedup = f"{baseFOLDER}/intermediate_files/{sample_id}_mapped.sorted_RDG.dedup.bam"
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{picardFOLDER}/picard.jar", "MarkDuplicates",
+        "-INPUT", bam_rdg,
+        "-OUTPUT", bam_dedup,
+        "-METRICS_FILE", f"{baseFOLDER}/intermediate_files/{sample_id}_markDuplicatesMetrics.txt",
+        "-ASSUME_SORTED", "True"
+    ])
+
+    # --- SAMTOOLS index ---
+    run_cmd([f"{bowtie2_samtools_FOLDER}/samtools", "index", bam_dedup])
+
+    # --- Crear índices de referencia ---
+    fasta = f"{originalfastaFOLDER}/Neisseria_gonorrhoeae_ATCC_19424.fasta"
+    run_cmd([f"{bowtie2_samtools_FOLDER}/samtools", "faidx", fasta])
+
+    dict_file = f"{originalfastaFOLDER}/Neisseria_gonorrhoeae_ATCC_19424.dict"
+    if not os.path.exists(dict_file):
+        run_cmd([
+            f"{javaFOLDER}/java", "-jar", f"{picardFOLDER}/picard.jar",
+            "CreateSequenceDictionary", "-R", fasta, "-O", dict_file
+        ])
+
+    # --- GATK HaplotypeCaller ---
+    vcf_raw = f"{baseFOLDER}/intermediate_files/{sample_id}_mapped.sorted_RDG.dedup.vcf"
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{GATKfolder}/gatk-package-4.6.2.0-local.jar", "HaplotypeCaller",
+        "-R", fasta,
+        "-I", bam_dedup,
+        "-O", vcf_raw
+    ])
+
+    # --- GATK VariantFiltration ---
+    vcf_filtered = f"{baseFOLDER}/intermediate_files/{sample_id}_filtered_variants.vcf"
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{GATKfolder}/gatk-package-4.6.2.0-local.jar", "VariantFiltration",
+        "-R", fasta,
+        "-V", vcf_raw,
+        "-O", vcf_filtered,
+        "--filter-name", "QD_filter", "--filter-expression", "QD < 2.0",
+        "--filter-name", "FS_filter", "--filter-expression", "FS > 60.0"
+    ])
+
+    # --- GATK SelectVariants ---
+    vcf_passed = f"{baseFOLDER}/rawpileup_files/{sample_id}_passed_variants.vcf"
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{GATKfolder}/gatk-package-4.6.2.0-local.jar", "SelectVariants",
+        "-R", fasta,
+        "-V", vcf_filtered,
+        "--exclude-filtered", "-O", vcf_passed
+    ])
+
+    # --- snpEff ---
+    vcf_annotated = f"{baseFOLDER}/annotated_files/{sample_id}_ann.vcf"
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{snpEffFOLDER}/snpEff.jar",
+        "NG19424", vcf_passed
+    ], cwd=f"{baseFOLDER}/annotated_files")
+
+    # --- SnpSift extractFields ---
+    tmpx = f"{HOME}/tmpX"
+    curated_pre = f"{baseFOLDER}/curated_files/{sample_id}_pre_curated"
+    curated_final = f"{baseFOLDER}/curated_files/{sample_id}_curated"
+
+    run_cmd(["perl", f"{snpEffFOLDER}/scripts/vcfEffOnePerLine.pl", vcf_annotated], cwd=HOME)
+    run_cmd([
+        f"{javaFOLDER}/java", "-jar", f"{snpsiftFOLDER}/SnpSift.jar", "extractFields",
+        tmpx, "CHROM", "POS", "REF", "ALT", 
+        "ANN[*].EFFECT", "ANN[*].IMPACT", "ANN[*].GENE", "ANN[*].GENEID",
+        "ANN[*].HGVS_C", "ANN[*].HGVS_P", "ANN[*].CDNA_POS", "ANN[*].CDNA_LEN",
+        "ANN[*].AA_POS", "ANN[*].AA_LEN"
+    ], cwd=f"{baseFOLDER}/curated_files")
+
+    # --- Filtrar variantes ---
+    with open(curated_pre, "r") as infile, open(curated_final, "w") as outfile:
+        for line in infile:
+            if not any(v in line for v in [
+                "downstream_gene_variant",
+                "intergenic_region",
+                "synonymous_variant",
+                "upstream_gene_variant"
+            ]):
+                outfile.write(line)
+
+    print(f"✅ Muestra {sample_id} procesada correctamente.\n")
+
+
+# ===========================
+# EJECUCIÓN
+# ===========================
+
+def main():
+    ensure_dirs()
+    with open(SAMPLES, "r") as fh:
+        for line in fh:
+            if line.strip():
+                process_sample(line.strip())
+
+if __name__ == "__main__":
+    main()
